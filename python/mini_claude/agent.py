@@ -5,6 +5,7 @@ Mirrors Claude Code's agent architecture."""
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import time
@@ -12,8 +13,10 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 
+import aiohttp
 import anthropic
 import openai
+from openai import AsyncAzureOpenAI
 
 from .tools import (
     tool_definitions,
@@ -66,6 +69,30 @@ async def _with_retry(fn, max_retries: int = 3):
             reason = f"HTTP {status}" if status else (getattr(error, "code", None) or "network error")
             print_retry(attempt + 1, max_retries, reason)
             await asyncio.sleep(delay)
+
+
+# ─── Azure OAuth token fetching ──────────────────────────
+
+async def _get_azure_access_token(client_id: str, client_secret: str) -> str:
+    """Get OAuth token from Cisco identity service for Azure OpenAI"""
+    url = "https://id.cisco.com/oauth2/default/v1/token"
+    payload = "grant_type=client_credentials"
+    value = base64.b64encode(f'{client_id}:{client_secret}'.encode('utf-8')).decode('utf-8')
+    headers = {
+        "Accept": "*/*",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Authorization": f"Basic {value}"
+    }
+    
+    timeout = aiohttp.ClientTimeout(total=30)
+    
+    async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+        async with session.post(url, data=payload, headers=headers) as response:
+            token_data = await response.json()
+            api_key = token_data.get('access_token')
+            if not api_key:
+                raise RuntimeError(f"Failed to get Azure access token: {token_data}")
+            return api_key
 
 
 # ─── Model context windows ──────────────────────────────────
@@ -151,6 +178,14 @@ class Agent:
         api_base: str | None = None,
         anthropic_base_url: str | None = None,
         api_key: str | None = None,
+        # Azure-specific parameters
+        use_azure: bool = False,
+        azure_endpoint: str | None = None,
+        azure_api_version: str = "2025-04-01-preview",
+        azure_appkey: str | None = None,
+        azure_client_id: str | None = None,
+        azure_client_secret: str | None = None,
+        # Other parameters
         thinking: bool = False,
         max_cost_usd: float | None = None,
         max_turns: int | None = None,
@@ -163,6 +198,10 @@ class Agent:
         self.thinking = thinking
         self.model = model
         self.use_openai = bool(api_base)
+        self.use_azure = use_azure
+        self.azure_appkey = azure_appkey
+        self.azure_client_id = azure_client_id
+        self.azure_client_secret = azure_client_secret
         self.is_sub_agent = is_sub_agent
         self.tools = custom_tools or tool_definitions
         self.max_cost_usd = max_cost_usd
@@ -210,9 +249,18 @@ class Agent:
             self._system_prompt = self._base_system_prompt
 
         # Initialize clients
-        if self.use_openai:
+        if self.use_azure:
+            # Azure OpenAI client - will be initialized async in _ensure_azure_client()
+            self._azure_client: AsyncAzureOpenAI | None = None
+            self._azure_endpoint = azure_endpoint or "https://chat-ai.cisco.com"
+            self._azure_api_version = azure_api_version
+            self._openai_client = None
+            self._anthropic_client = None
+            self._openai_messages.append({"role": "system", "content": self._system_prompt})
+        elif self.use_openai:
             self._openai_client = openai.AsyncOpenAI(base_url=api_base, api_key=api_key)
             self._anthropic_client = None
+            self._azure_client = None
             self._openai_messages.append({"role": "system", "content": self._system_prompt})
         else:
             kwargs: dict[str, Any] = {}
@@ -222,6 +270,7 @@ class Agent:
                 kwargs["base_url"] = anthropic_base_url
             self._anthropic_client = anthropic.AsyncAnthropic(**kwargs)
             self._openai_client = None
+            self._azure_client = None
 
     def _resolve_thinking_mode(self) -> str:
         if not self.thinking:
@@ -255,7 +304,7 @@ class Agent:
             self._pre_plan_mode = None
             self._plan_file_path = None
             self._system_prompt = self._base_system_prompt
-            if self.use_openai and self._openai_messages:
+            if (self.use_openai or self.use_azure) and self._openai_messages:
                 self._openai_messages[0]["content"] = self._system_prompt
             print_info(f"Exited plan mode → {self.permission_mode} mode")
             return self.permission_mode
@@ -264,7 +313,7 @@ class Agent:
             self.permission_mode = "plan"
             self._plan_file_path = self._generate_plan_file_path()
             self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
-            if self.use_openai and self._openai_messages:
+            if (self.use_openai or self.use_azure) and self._openai_messages:
                 self._openai_messages[0]["content"] = self._system_prompt
             print_info(f"Entered plan mode. Plan file: {self._plan_file_path}")
             return "plan"
@@ -274,9 +323,34 @@ class Agent:
 
     # ─── Main entry point ────────────────────────────────────
 
+    async def _ensure_azure_client(self) -> None:
+        """Initialize Azure client with OAuth token if not already initialized"""
+        if self._azure_client is None and self.use_azure:
+            if not self.azure_client_id or not self.azure_client_secret:
+                raise ValueError("Azure OAuth requires AZURE_CLIENT_ID and AZURE_CLIENT_SECRET")
+            
+            # Fetch OAuth token
+            api_key = await _get_azure_access_token(self.azure_client_id, self.azure_client_secret)
+            
+            # Initialize Azure OpenAI client
+            self._azure_client = AsyncAzureOpenAI(
+                azure_endpoint=self._azure_endpoint,
+                api_key=api_key,
+                api_version=self._azure_api_version,
+            )
+
     async def chat(self, user_message: str) -> None:
         self._aborted = False
-        coro = self._chat_openai(user_message) if self.use_openai else self._chat_anthropic(user_message)
+        
+        # Ensure Azure client is initialized if using Azure
+        if self.use_azure:
+            await self._ensure_azure_client()
+            coro = self._chat_azure(user_message)
+        elif self.use_openai:
+            coro = self._chat_openai(user_message)
+        else:
+            coro = self._chat_anthropic(user_message)
+            
         self._current_task = asyncio.current_task()
         try:
             await coro
@@ -318,7 +392,7 @@ class Agent:
     def clear_history(self) -> None:
         self._anthropic_messages = []
         self._openai_messages = []
-        if self.use_openai:
+        if self.use_openai or self.use_azure:
             self._openai_messages.append({"role": "system", "content": self._system_prompt})
         self.total_input_tokens = 0
         self.total_output_tokens = 0
@@ -354,7 +428,7 @@ class Agent:
         print_info(f"Session restored ({self._get_message_count()} messages).")
 
     def _get_message_count(self) -> int:
-        return len(self._openai_messages) if self.use_openai else len(self._anthropic_messages)
+        return len(self._openai_messages) if (self.use_openai or self.use_azure) else len(self._anthropic_messages)
 
     def _auto_save(self) -> None:
         try:
@@ -366,8 +440,8 @@ class Agent:
                     "startTime": self.session_start_time,
                     "messageCount": self._get_message_count(),
                 },
-                "anthropicMessages": self._anthropic_messages if not self.use_openai else None,
-                "openaiMessages": self._openai_messages if self.use_openai else None,
+                "anthropicMessages": self._anthropic_messages if not (self.use_openai or self.use_azure) else None,
+                "openaiMessages": self._openai_messages if (self.use_openai or self.use_azure) else None,
             })
         except Exception:
             pass
@@ -380,7 +454,7 @@ class Agent:
             await self._compact_conversation()
 
     async def _compact_conversation(self) -> None:
-        if self.use_openai:
+        if self.use_openai or self.use_azure:
             await self._compact_openai()
         else:
             await self._compact_anthropic()
@@ -435,7 +509,7 @@ class Agent:
     # ─── Multi-tier compression pipeline ──────────────────────
 
     def _run_compression_pipeline(self) -> None:
-        if self.use_openai:
+        if self.use_openai or self.use_azure:
             self._budget_tool_results_openai()
             self._snip_stale_results_openai()
             self._microcompact_openai()
@@ -586,6 +660,12 @@ class Agent:
             sub_agent = Agent(
                 model=self.model,
                 api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
+                use_azure=self.use_azure,
+                azure_endpoint=self._azure_endpoint if self.use_azure else None,
+                azure_api_version=self._azure_api_version if self.use_azure else None,
+                azure_appkey=self.azure_appkey if self.use_azure else None,
+                azure_client_id=self.azure_client_id if self.use_azure else None,
+                azure_client_secret=self.azure_client_secret if self.use_azure else None,
                 custom_system_prompt=result["prompt"],
                 custom_tools=tools,
                 is_sub_agent=True,
@@ -639,7 +719,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             self.permission_mode = "plan"
             self._plan_file_path = self._generate_plan_file_path()
             self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
-            if self.use_openai and self._openai_messages:
+            if (self.use_openai or self.use_azure) and self._openai_messages:
                 self._openai_messages[0]["content"] = self._system_prompt
             print_info("Entered plan mode (read-only). Plan file: " + self._plan_file_path)
             return f"Entered plan mode. You are now in read-only mode.\n\nYour plan file: {self._plan_file_path}\nWrite your plan to this file. This is the only file you can edit.\n\nWhen your plan is complete, call exit_plan_mode."
@@ -704,7 +784,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             self._pre_plan_mode = None
             self._plan_file_path = None
             self._system_prompt = self._base_system_prompt
-            if self.use_openai and self._openai_messages:
+            if (self.use_openai or self.use_azure) and self._openai_messages:
                 self._openai_messages[0]["content"] = self._system_prompt
             print_info("Exited plan mode. Restored to " + self.permission_mode + " mode.")
             return f"Exited plan mode. Permission mode restored to: {self.permission_mode}\n\n## Your Plan:\n{plan_content}"
@@ -715,7 +795,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         """Clear history but keep system prompt (used for clear-context plan approval)."""
         self._anthropic_messages = []
         self._openai_messages = []
-        if self.use_openai:
+        if self.use_openai or self.use_azure:
             self._openai_messages.append({"role": "system", "content": self._system_prompt})
         self.last_input_token_count = 0
 
@@ -730,6 +810,12 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         sub_agent = Agent(
             model=self.model,
             api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
+            use_azure=self.use_azure,
+            azure_endpoint=self._azure_endpoint if self.use_azure else None,
+            azure_api_version=self._azure_api_version if self.use_azure else None,
+            azure_appkey=self.azure_appkey if self.use_azure else None,
+            azure_client_id=self.azure_client_id if self.use_azure else None,
+            azure_client_secret=self.azure_client_secret if self.use_azure else None,
             custom_system_prompt=config["system_prompt"],
             custom_tools=config["tools"],
             is_sub_agent=True,
@@ -966,6 +1052,166 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 messages=self._openai_messages,
                 stream=True,
                 stream_options={"include_usage": True},
+            )
+
+            content = ""
+            first_text = True
+            tool_calls: dict[int, dict] = {}
+            finish_reason = ""
+            usage = None
+
+            async for chunk in stream:
+                if chunk.usage:
+                    usage = {
+                        "prompt_tokens": chunk.usage.prompt_tokens,
+                        "completion_tokens": chunk.usage.completion_tokens,
+                    }
+
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+
+                if delta and delta.content:
+                    if first_text:
+                        stop_spinner()
+                        self._emit_text("\n")
+                        first_text = False
+                    self._emit_text(delta.content)
+                    content += delta.content
+
+                if delta and delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        existing = tool_calls.get(tc.index)
+                        if existing:
+                            if tc.function and tc.function.arguments:
+                                existing["arguments"] += tc.function.arguments
+                        else:
+                            tool_calls[tc.index] = {
+                                "id": tc.id or "",
+                                "name": (tc.function.name if tc.function else "") or "",
+                                "arguments": (tc.function.arguments if tc.function else "") or "",
+                            }
+
+                if chunk.choices[0].finish_reason:
+                    finish_reason = chunk.choices[0].finish_reason
+
+            assembled = None
+            if tool_calls:
+                assembled = [
+                    {"id": tc["id"], "type": "function", "function": {"name": tc["name"], "arguments": tc["arguments"]}}
+                    for _, tc in sorted(tool_calls.items())
+                ]
+
+            return {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": content or None,
+                        "tool_calls": assembled,
+                    },
+                    "finish_reason": finish_reason or "stop",
+                }],
+                "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0},
+            }
+
+        return await _with_retry(_do)
+
+    # ─── Azure OpenAI backend ────────────────────────────────────
+
+    async def _chat_azure(self, user_message: str) -> None:
+        """Azure OpenAI chat method - uses OpenAI message format with Azure-specific user field"""
+        self._openai_messages.append({"role": "user", "content": user_message})
+
+        while True:
+            if self._aborted:
+                break
+
+            self._run_compression_pipeline()
+
+            if not self.is_sub_agent:
+                start_spinner()
+
+            response = await self._call_azure_stream()
+
+            if not self.is_sub_agent:
+                stop_spinner()
+
+            self.last_api_call_time = time.time()
+
+            if response.get("usage"):
+                self.total_input_tokens += response["usage"]["prompt_tokens"]
+                self.total_output_tokens += response["usage"]["completion_tokens"]
+                self.last_input_token_count = response["usage"]["prompt_tokens"]
+
+            choice = response.get("choices", [{}])[0] if response.get("choices") else {}
+            message = choice.get("message", {})
+
+            self._openai_messages.append(message)
+
+            tool_calls = message.get("tool_calls")
+            if not tool_calls:
+                if not self.is_sub_agent:
+                    print_cost(self.total_input_tokens, self.total_output_tokens)
+                break
+
+            self.current_turns += 1
+            budget = self._check_budget()
+            if budget["exceeded"]:
+                print_info(f"Budget exceeded: {budget['reason']}")
+                break
+
+            for tc in tool_calls:
+                if self._aborted:
+                    break
+                if tc.get("type") != "function":
+                    continue
+                fn_name = tc["function"]["name"]
+                try:
+                    inp = json.loads(tc["function"]["arguments"])
+                except Exception:
+                    inp = {}
+
+                print_tool_call(fn_name, inp)
+
+                perm = check_permission(fn_name, inp, self.permission_mode, self._plan_file_path)
+                if perm["action"] == "deny":
+                    print_info(f"Denied: {perm.get('message', '')}")
+                    self._openai_messages.append({"role": "tool", "tool_call_id": tc["id"], "content": f"Action denied: {perm.get('message', '')}"})
+                    continue
+                if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
+                    confirmed = await self._confirm_dangerous(perm["message"])
+                    if not confirmed:
+                        self._openai_messages.append({"role": "tool", "tool_call_id": tc["id"], "content": "User denied this action."})
+                        continue
+                    self._confirmed_paths.add(perm["message"])
+
+                result = await self._execute_tool_call(fn_name, inp)
+                print_tool_result(fn_name, result)
+
+                if self._context_cleared:
+                    self._context_cleared = False
+                    self._openai_messages.append({"role": "user", "content": result})
+                    break
+
+                self._openai_messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+
+            self._context_cleared = False
+            await self._check_and_compact()
+
+    async def _call_azure_stream(self) -> dict:
+        """Call Azure OpenAI API with streaming and appkey in user field"""
+        async def _do():
+            # Build user field with appkey
+            user_field = json.dumps({"appkey": self.azure_appkey}) if self.azure_appkey else None
+            
+            stream = await self._azure_client.chat.completions.create(
+                model=self.model,
+                max_tokens=16384,
+                tools=_to_openai_tools(self.tools),
+                messages=self._openai_messages,
+                stream=True,
+                stream_options={"include_usage": True},
+                user=user_field,
             )
 
             content = ""

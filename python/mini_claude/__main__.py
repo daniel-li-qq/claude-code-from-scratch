@@ -29,6 +29,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--thinking", action="store_true", help="Enable extended thinking")
     parser.add_argument("--model", "-m", default=None, help="Model to use")
     parser.add_argument("--api-base", default=None, help="OpenAI-compatible API base URL")
+    # Azure-specific arguments
+    parser.add_argument("--azure", action="store_true", help="Use Azure OpenAI backend")
+    parser.add_argument("--azure-endpoint", default=None, help="Azure OpenAI endpoint (default: https://chat-ai.cisco.com)")
+    parser.add_argument("--azure-api-version", default="2025-04-01-preview", help="Azure API version")
+    parser.add_argument("--azure-appkey", default=None, help="Azure appkey for user field")
+    parser.add_argument("--azure-client-id", default=None, help="Azure OAuth client ID")
+    parser.add_argument("--azure-client-secret", default=None, help="Azure OAuth client secret")
+    # Other arguments
     parser.add_argument("--resume", action="store_true", help="Resume last session")
     parser.add_argument("--max-cost", type=float, default=None, help="Max USD spend")
     parser.add_argument("--max-turns", type=int, default=None, help="Max agentic turns")
@@ -203,6 +211,12 @@ Options:
   --thinking          Enable extended thinking (Anthropic only)
   --model, -m         Model to use (default: claude-opus-4-6, or MINI_CLAUDE_MODEL env)
   --api-base URL      Use OpenAI-compatible API endpoint (key via env var)
+  --azure             Use Azure OpenAI backend
+  --azure-endpoint    Azure OpenAI endpoint (default: https://chat-ai.cisco.com)
+  --azure-api-version Azure API version (default: 2025-04-01-preview)
+  --azure-appkey      Azure appkey for user field
+  --azure-client-id   Azure OAuth client ID (or AZURE_CLIENT_ID env)
+  --azure-client-secret Azure OAuth client secret (or AZURE_CLIENT_SECRET env)
   --resume            Resume the last session
   --max-cost USD      Stop when estimated cost exceeds this amount
   --max-turns N       Stop after N agentic turns
@@ -218,11 +232,19 @@ REPL commands:
   /<skill-name>       Invoke a skill (e.g. /commit "fix types")
 
 Examples:
-  mini-claude "fix the bug in src/app.ts"
+  # Anthropic
+  ANTHROPIC_API_KEY=sk-ant-xxx mini-claude "fix the bug in src/app.ts"
+  
+  # OpenAI compatible
+  OPENAI_API_KEY=sk-xxx OPENAI_BASE_URL=https://api.openai.com/v1 mini-claude --model gpt-4o "hello"
+  
+  # Azure OpenAI
+  AZURE_CLIENT_ID=xxx AZURE_CLIENT_SECRET=yyy mini-claude --azure --model gpt-5-nano "hello"
+  
+  # Other examples
   mini-claude --yolo "run all tests and fix failures"
   mini-claude --plan "how would you refactor this?"
   mini-claude --max-cost 0.50 --max-turns 20 "implement feature X"
-  OPENAI_API_KEY=sk-xxx mini-claude --api-base https://aihubmix.com/v1 --model gpt-4o "hello"
   mini-claude --resume
   mini-claude  # starts interactive REPL
 """)
@@ -232,46 +254,86 @@ Examples:
     model = args.model or os.environ.get("MINI_CLAUDE_MODEL", "claude-opus-4-6")
     api_base = args.api_base
 
-    # Resolve API config
-    resolved_api_base = api_base
-    resolved_api_key: str | None = None
-    resolved_use_openai = bool(api_base)
+    # Check for Azure mode
+    use_azure = args.azure or bool(os.environ.get("AZURE_OPENAI_ENDPOINT"))
+    
+    if use_azure:
+        # Azure OpenAI configuration
+        azure_endpoint = args.azure_endpoint or os.environ.get("AZURE_OPENAI_ENDPOINT", "https://chat-ai.cisco.com")
+        azure_api_version = args.azure_api_version or os.environ.get("AZURE_API_VERSION", "2025-04-01-preview")
+        azure_appkey = args.azure_appkey or os.environ.get("AZURE_APPKEY")
+        azure_client_id = args.azure_client_id or os.environ.get("AZURE_CLIENT_ID")
+        azure_client_secret = args.azure_client_secret or os.environ.get("AZURE_CLIENT_SECRET")
+        
+        if not azure_client_id or not azure_client_secret:
+            print_error(
+                "Azure OpenAI requires OAuth credentials.\n"
+                "  Set AZURE_CLIENT_ID and AZURE_CLIENT_SECRET environment variables,\n"
+                "  or use --azure-client-id and --azure-client-secret options."
+            )
+            sys.exit(1)
+        if not azure_appkey:
+            print_error(
+                "Azure OpenAI requires an appkey.\n"
+                "  Set AZURE_APPKEY or use --azure-appkey."
+            )
+            sys.exit(1)
 
-    if os.environ.get("OPENAI_API_KEY") and os.environ.get("OPENAI_BASE_URL"):
-        resolved_api_key = os.environ["OPENAI_API_KEY"]
-        resolved_api_base = resolved_api_base or os.environ.get("OPENAI_BASE_URL")
-        resolved_use_openai = True
-    elif os.environ.get("ANTHROPIC_API_KEY"):
-        resolved_api_key = os.environ["ANTHROPIC_API_KEY"]
-        resolved_api_base = resolved_api_base or os.environ.get("ANTHROPIC_BASE_URL")
-        resolved_use_openai = False
-    elif os.environ.get("OPENAI_API_KEY"):
-        resolved_api_key = os.environ["OPENAI_API_KEY"]
-        resolved_api_base = resolved_api_base or os.environ.get("OPENAI_BASE_URL")
-        resolved_use_openai = True
-
-    if not resolved_api_key and api_base:
-        resolved_api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
-        resolved_use_openai = True
-
-    if not resolved_api_key:
-        print_error(
-            "API key is required.\n"
-            "  Set ANTHROPIC_API_KEY (+ optional ANTHROPIC_BASE_URL) for Anthropic format,\n"
-            "  or OPENAI_API_KEY + OPENAI_BASE_URL for OpenAI-compatible format."
+        agent = Agent(
+            permission_mode=permission_mode,
+            model=model,
+            thinking=args.thinking,
+            max_cost_usd=args.max_cost,
+            max_turns=args.max_turns,
+            use_azure=True,
+            azure_endpoint=azure_endpoint,
+            azure_api_version=azure_api_version,
+            azure_appkey=azure_appkey,
+            azure_client_id=azure_client_id,
+            azure_client_secret=azure_client_secret,
         )
-        sys.exit(1)
+    else:
+        # Existing Anthropic/OpenAI logic
+        resolved_api_base = api_base
+        resolved_api_key: str | None = None
+        resolved_use_openai = bool(api_base)
 
-    agent = Agent(
-        permission_mode=permission_mode,
-        model=model,
-        thinking=args.thinking,
-        max_cost_usd=args.max_cost,
-        max_turns=args.max_turns,
-        api_base=resolved_api_base if resolved_use_openai else None,
-        anthropic_base_url=resolved_api_base if not resolved_use_openai else None,
-        api_key=resolved_api_key,
-    )
+        if os.environ.get("OPENAI_API_KEY") and os.environ.get("OPENAI_BASE_URL"):
+            resolved_api_key = os.environ["OPENAI_API_KEY"]
+            resolved_api_base = resolved_api_base or os.environ.get("OPENAI_BASE_URL")
+            resolved_use_openai = True
+        elif os.environ.get("ANTHROPIC_API_KEY"):
+            resolved_api_key = os.environ["ANTHROPIC_API_KEY"]
+            resolved_api_base = resolved_api_base or os.environ.get("ANTHROPIC_BASE_URL")
+            resolved_use_openai = False
+        elif os.environ.get("OPENAI_API_KEY"):
+            resolved_api_key = os.environ["OPENAI_API_KEY"]
+            resolved_api_base = resolved_api_base or os.environ.get("OPENAI_BASE_URL")
+            resolved_use_openai = True
+
+        if not resolved_api_key and api_base:
+            resolved_api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+            resolved_use_openai = True
+
+        if not resolved_api_key:
+            print_error(
+                "API key is required.\n"
+                "  Set ANTHROPIC_API_KEY (+ optional ANTHROPIC_BASE_URL) for Anthropic format,\n"
+                "  or OPENAI_API_KEY + OPENAI_BASE_URL for OpenAI-compatible format,\n"
+                "  or use --azure with AZURE_CLIENT_ID and AZURE_CLIENT_SECRET for Azure OpenAI."
+            )
+            sys.exit(1)
+
+        agent = Agent(
+            permission_mode=permission_mode,
+            model=model,
+            thinking=args.thinking,
+            max_cost_usd=args.max_cost,
+            max_turns=args.max_turns,
+            api_base=resolved_api_base if resolved_use_openai else None,
+            anthropic_base_url=resolved_api_base if not resolved_use_openai else None,
+            api_key=resolved_api_key,
+        )
 
     # Resume session
     if args.resume:
